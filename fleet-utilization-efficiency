@@ -46,7 +46,7 @@ WHERE
     f.delivery_site_name NOT LIKE '%WFH%'  
     AND f.flight_launched_at IS NOT NULL
     AND h.is_production_hub = TRUE
-    AND EXTRACT(YEAR FROM f.file_timestamp) >= 2023
+   
 GROUP BY 
     h.hub_name,
     h.hub_id,
