@@ -1,0 +1,144 @@
+WITH rotables AS (
+    -- Extract active rotables (Battery, Wing, Body) currently in service or reserve
+    SELECT 
+        h.country,
+        h.hub_name AS hub,
+        r.model,
+        r.rotable_id,
+        r.serial_number,
+        r.part_number,
+        r.part_name,
+        r.lot_id,
+        r.status,
+        r.location_id,
+        i.location_name
+    FROM 
+        analytics.rotables r
+    LEFT JOIN analytics.inventory i ON i.stock_location_id = r.location_id
+    LEFT JOIN analytics.dim_hubs h ON i.hub_id = h.hub_id
+    WHERE 
+        r.model IN ('Body', 'Battery', 'Wing')
+        AND i.location_is_active = TRUE
+        AND h.is_production_hub = TRUE
+        AND h.hub_name IS NOT NULL
+        AND (r.stock_location ILIKE '%Reserved%' OR r.stock_location ILIKE '%Service%')
+    ORDER BY 
+        r.model
+),
+service_requests AS (
+    -- Extract critical service requests and calculate maintenance resolution times
+    SELECT 
+        vs.service_request_id,
+        vs.name AS service_request_name,
+        vs.title AS service_request_title,
+        vs.lot_id,
+        vs.deadline_date,
+        COALESCE(vs.deadline_date, vs.create_date) AS date_grounded,
+        vs.sr_closed_date AS date_resolved,
+        
+        -- Calculate Mean Time to Repair (MTTR) in days
+        DATEDIFF(
+            DAY, 
+            COALESCE(vs.deadline_date, vs.create_date), 
+            vs.sr_closed_date
+        ) AS mttr,
+
+        CONCAT('OSD-', vs.jira_ref) AS osd_ticket,
+        j.current_status AS ticket_status,
+        j.assignee_name AS assignee,
+        j.reporter_name AS reporter,
+        j.current_priority AS ticket_priority,
+        u.full_name AS closed_by
+    FROM 
+        analytics.service_requests vs
+    LEFT JOIN analytics.jira_issues j ON CONCAT('OSD-', vs.jira_ref) = j.issue_key
+    LEFT JOIN analytics.users u ON u.user_id = vs.sr_closed_by
+    WHERE 
+        vs.priority = 'critical'
+        AND vs.active = TRUE
+        AND vs.lot_id IS NOT NULL
+)
+-- Final Query: Rotable Maintenance & Resolution Analysis
+SELECT 
+    r.hub,
+    DATE_TRUNC('day', sr.date_grounded) AS report_date,
+    r.country,
+    r.model,
+    r.serial_number,
+    r.part_name,
+    r.rotable_id,
+    r.lot_id,
+    r.location_name,
+
+    -- Aggregate service request details per rotable component
+    ARRAY_TO_STRING(
+        ARRAY_AGG(DISTINCT sr.service_request_name || ': ' || sr.service_request_title), 
+        ' || '
+    ) AS grounding_service_requests,
+
+    -- Determine status based on maintenance conditions
+    CASE 
+        WHEN grounding_service_requests ILIKE '%As-maintained%' THEN 'UP'
+        WHEN r.status ILIKE '%Maintenance%' THEN 'DOWN'
+        ELSE r.status
+    END AS status,
+
+    sr.date_grounded,
+    sr.date_resolved,
+
+    -- Classify maintenance type (Routine vs. Non-Routine)
+    CASE 
+        WHEN r.status = 'DOWN' THEN 
+            CASE 
+                WHEN sr.deadline_date IS NULL THEN 'Non-Routine Maintenance'
+                ELSE 'Routine Maintenance'
+            END
+        ELSE NULL
+    END AS maintenance_type,
+
+    sr.osd_ticket,
+    sr.ticket_status,
+    sr.assignee,
+    sr.reporter,
+    sr.ticket_priority,
+    sr.closed_by,
+
+    -- Boolean flag to indicate if a Jira ticket exists
+    sr.osd_ticket IS NOT NULL AS has_ticket,
+
+    -- Ensure MTTR is non-negative
+    CASE 
+        WHEN MAX(sr.mttr) < 0 THEN 0
+        ELSE MAX(sr.mttr)
+    END AS mttr
+
+FROM 
+    rotables r
+LEFT JOIN 
+    service_requests sr 
+    ON r.lot_id = sr.lot_id
+    AND sr.date_resolved IS NOT NULL
+WHERE 
+    r.model IN ('Wing', 'Body', 'Battery')
+GROUP BY 
+    r.hub,
+    r.country,
+    r.model,
+    r.serial_number,
+    r.part_name,
+    r.rotable_id,
+    r.lot_id,
+    r.location_name,
+    r.status,
+    sr.osd_ticket,
+    sr.ticket_status,
+    sr.assignee,
+    sr.reporter,
+    sr.ticket_priority,
+    sr.date_grounded,
+    sr.date_resolved,
+    sr.closed_by,
+    maintenance_type,
+    has_ticket
+ORDER BY 
+    report_date DESC;
