@@ -1,0 +1,110 @@
+WITH aggregated_offnominals AS (
+    -- Aggregate flight off-nominal events by flight ID and nest
+    SELECT 
+        DISTINCT nest_id,
+        flight_id,
+        ARRAY_TO_STRING(ARRAY_AGG(DISTINCT category), ' || ') AS flight_category,
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT category || ' > ' || event_name), 
+            ' || '
+        ) AS flight_offnominal
+    FROM 
+        analytics.flight_off_nominals
+    GROUP BY 
+        nest_id, flight_id
+)
+-- Final Query: Fleet Availability & Delivery Delays Analysis
+SELECT 
+    DISTINCT DATE_TRUNC('day', d.flight_launched_at) AS report_date,
+    o.order_confirmed_at,
+    d.delivery_completed_at,
+    d.flight_scheduled_at,
+    o.order_id,
+    d.flight_id,
+    d.package_id,
+    o.facility_name AS health_facility,
+    d.shipment_priority,
+    offn.flight_category AS category,
+    offn.flight_offnominal,
+    ord_off.event_name AS order_offnominal,
+    d.reschedule_reason,
+    h.hub_name AS hub,
+
+    -- Categorize affected fleet components
+    CASE 
+        WHEN offn.flight_offnominal ILIKE '%Body%' THEN 'Body'
+        WHEN offn.flight_offnominal ILIKE '%Batteries%' THEN 'Battery'
+        WHEN offn.flight_offnominal ILIKE '%Wing%' THEN 'Wing'
+        ELSE 'Other'
+    END AS model,
+
+    -- Determine fleet availability
+    CASE 
+        WHEN flight_category ILIKE '%Flight volume%' 
+        AND model != 'Other' THEN FALSE
+        ELSE TRUE
+    END AS fleet_available,
+
+    -- Calculate time from order confirmation to delivery
+    CASE 
+        WHEN fleet_available = FALSE 
+        AND model != 'Other' THEN DATEDIFF(
+            MINUTE, 
+            o.order_confirmed_at, 
+            d.delivery_completed_at
+        )
+        ELSE NULL
+    END AS order_to_receive,
+
+    -- Calculate time from package commitment to launch
+    CASE 
+        WHEN fleet_available = FALSE 
+        AND model != 'Other' THEN DATEDIFF(
+            MINUTE, 
+            d.package_committed_at, 
+            d.flight_launched_at
+        )
+        ELSE NULL
+    END AS committed_to_launch,
+
+    -- Calculate time from flight launch to delivery
+    CASE 
+        WHEN fleet_available = FALSE 
+        AND model != 'Other' THEN DATEDIFF(
+            MINUTE, 
+            d.flight_launched_at, 
+            d.delivery_completed_at
+        )
+        ELSE NULL
+    END AS time_to_deliver_mins,
+
+    -- Calculate total order delay
+    order_to_receive - time_to_deliver_mins AS order_delay,
+
+    -- Calculate days to deliver
+    CASE 
+        WHEN (order_to_receive / 60) < 24 THEN 1
+        ELSE ROUND(order_to_receive / (24 * 60))
+    END AS days_to_deliver
+
+FROM 
+    analytics.deliveries d
+LEFT JOIN 
+    analytics.orders o 
+    ON o.hub_id = d.hub_id 
+    AND o.order_key = d.order_key
+LEFT JOIN 
+    analytics.order_off_nominals ord_off 
+    ON ord_off.hub_id = d.hub_id 
+    AND o.order_id = ord_off.order_id
+LEFT JOIN 
+    analytics.dim_hubs h 
+    ON d.hub_id = h.hub_id
+LEFT JOIN 
+    aggregated_offnominals offn 
+    ON d.flight_id = offn.flight_id 
+    AND d.hub_id = offn.nest_id
+WHERE 
+    EXTRACT(YEAR FROM d.flight_launched_at) >= 2024
+ORDER BY 
+    report_date DESC NULLS LAST;
