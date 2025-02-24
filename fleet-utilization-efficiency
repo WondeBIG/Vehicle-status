@@ -1,1 +1,57 @@
+WITH days_in_month AS (
+    -- Calculate the total number of days in each month from flight data
+    SELECT 
+        f.file_timestamp,
+        DAY(LAST_DAY(f.file_timestamp)) AS days_in_month
+    FROM 
+        analytics.flight_data f
+),
+operational_days AS (
+    -- Determine the number of unique operational days per nest
+    SELECT DISTINCT 
+        nest_id,
+        file_timestamp,
+        DATE(file_timestamp) AS report_date,
+        COUNT(DATE(file_timestamp)) OVER (PARTITION BY nest_id, DATE(file_timestamp)) AS date_count
+    FROM 
+        analytics.flight_data
+)
+-- Final Query: Flight Utilization & Performance Analysis
+SELECT 
+    h.hub_name AS hub,
+    h.hub_id,
+    DATE_TRUNC('day', f.file_timestamp) AS report_date,
+    SUM(f.flight_duration_s) / 3600.0 AS flight_duration_hrs,
+    SUM(f.flight_distance_m) / 1000.0 AS flight_distance_km,
+    d.date_count,
+    dm.days_in_month,
+    COUNT(DISTINCT f.vehicle_id) AS vehicles_flown,
 
+    -- Compute fleet utilization per operational day
+    (SUM(f.flight_duration_s) / 3600.0) / (COUNT(DISTINCT f.vehicle_id) * d.date_count) AS fleet_utilization
+
+FROM 
+    analytics.flight_data f
+JOIN 
+    operational_days d 
+    ON f.file_timestamp = d.file_timestamp
+    AND f.nest_id = d.nest_id
+JOIN 
+    analytics.dim_hubs h 
+    ON h.hub_id = f.nest_id
+JOIN 
+    days_in_month dm 
+    ON dm.file_timestamp = f.file_timestamp
+WHERE 
+    f.delivery_site_name NOT LIKE '%WFH%'  
+    AND f.flight_launched_at IS NOT NULL
+    AND h.is_production_hub = TRUE
+    AND EXTRACT(YEAR FROM f.file_timestamp) >= 2023
+GROUP BY 
+    h.hub_name,
+    h.hub_id,
+    report_date,
+    d.date_count,
+    dm.days_in_month
+ORDER BY 
+    report_date DESC
