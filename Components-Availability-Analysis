@@ -1,0 +1,135 @@
+WITH rotables AS (
+    -- Extract active rotables (Battery, Wing, Body) currently in service or reserve
+    SELECT 
+        n.country,
+        n.hub_name AS hub,
+        r.model,
+        r.rotable_id,
+        r.serial_number,
+        r.part_number,
+        r.part_name,
+        r.lot_id,
+        r.status,
+        r.location_id,
+        i.location_name,
+        CASE 
+            WHEN i.location_name ILIKE '%Service%' THEN 'In Service'
+            WHEN i.location_name ILIKE '%Reserve%' THEN 'Reserved'
+            ELSE i.location_name 
+        END AS categorized_location
+    FROM 
+        analytics.rotables r
+    LEFT JOIN analytics.inventory i ON i.stock_location_id = r.location_id
+    LEFT JOIN analytics.dim_hubs n ON i.hub_id = n.hub_id
+    WHERE 
+        r.model IN ('Body', 'Battery', 'Wing')
+        AND i.location_is_active = TRUE
+        AND n.is_production_hub = TRUE
+        AND n.hub_name IS NOT NULL
+        AND (r.stock_location ILIKE '%Reserve%' OR r.stock_location ILIKE '%Service%')
+    ORDER BY 
+        r.model
+),
+service_requests AS (
+    -- Extract critical service requests linked to rotable components
+    SELECT 
+        v.vehicle_number,
+        v.vehicle_id,
+        v.name AS service_request_name,
+        v.title AS service_request_title,
+        v.lot_id,
+        v.create_date,
+        v.deadline_date,
+        v.sr_closed_date AS close_date,
+        DATEDIFF(
+            DAY, 
+            COALESCE(v.deadline_date, v.create_date), 
+            CURRENT_DATE()
+        ) AS days_down,
+        CONCAT('OSD-', v.jira_ref) AS osd_ticket,
+        j.current_status AS ticket_status,
+        j.assignee_name AS assignee,
+        j.reporter_name AS reporter,
+        j.current_priority AS ticket_priority
+    FROM 
+        analytics.service_requests v
+    LEFT JOIN analytics.jira_issues j ON CONCAT('OSD-', v.jira_ref) = j.issue_key
+    WHERE 
+        v.priority = 'critical'
+        AND v.active = TRUE
+        AND v.lot_id IS NOT NULL
+)
+-- Final Query: Rotable Availability and Maintenance Tracking
+SELECT 
+    r.hub,
+    r.country,
+    r.model,
+    r.serial_number,
+    r.part_name,
+    r.rotable_id,
+    r.lot_id,
+    r.categorized_location AS location_name,
+
+    -- Aggregate service request details for each rotable component
+    ARRAY_TO_STRING(
+        ARRAY_AGG(DISTINCT sr.service_request_name || ': ' || sr.service_request_title),
+        ' || '
+    ) AS grounding_service_requests,
+
+    -- Determine status based on maintenance conditions
+    CASE 
+        WHEN grounding_service_requests ILIKE '%As-maintained%' THEN 'UP'
+        WHEN r.status ILIKE '%Maintenance%' THEN 'DOWN'
+        ELSE r.status
+    END AS status,
+
+    -- Classify maintenance type
+    CASE 
+        WHEN r.status = 'DOWN' THEN 
+            CASE 
+                WHEN sr.deadline_date IS NULL THEN 'Non-Routine Maintenance'
+                ELSE 'Routine Maintenance'
+            END
+        ELSE NULL
+    END AS maintenance_type,
+
+    sr.osd_ticket,
+    sr.ticket_status,
+    sr.assignee,
+    sr.reporter,
+    sr.ticket_priority,
+
+    -- Calculate maximum downtime (ensuring no negative values)
+    CASE 
+        WHEN MAX(sr.days_down) < 0 THEN 0
+        ELSE MAX(sr.days_down)
+    END AS days_down
+
+FROM 
+    rotables r
+LEFT JOIN 
+    service_requests sr 
+    ON r.serial_number = sr.vehicle_number 
+    AND r.rotable_id = sr.vehicle_id
+    AND (r.status = 'DOWN' OR UPPER(r.status) = 'IN MAINTENANCE')
+    AND sr.close_date IS NULL
+WHERE 
+    r.model IN ('Wing', 'Body', 'Battery')
+GROUP BY 
+    r.hub,
+    r.country,
+    r.model,
+    r.serial_number,
+    r.part_name,
+    r.rotable_id,
+    r.lot_id,
+    r.categorized_location,
+    r.status,
+    sr.osd_ticket,
+    sr.ticket_status,
+    sr.assignee,
+    sr.reporter,
+    maintenance_type,
+    sr.ticket_priority
+ORDER BY 
+    days_down DESC NULLS LAST;
